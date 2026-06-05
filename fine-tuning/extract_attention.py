@@ -27,7 +27,11 @@ from uer.opts import finetune_opts  # noqa: E402
 from uer.layers.multi_headed_attn import MultiHeadedAttention  # noqa: E402
 from run_classifier import Classifier, count_labels_num, read_dataset  # noqa: E402
 
-from asnfm.metrics.sink import anchor_ratio, attention_entropy, sink_mass, sink_rate  # noqa: E402
+from asnfm.metrics.bai import (  # noqa: E402  公式準拠（Bai et al. COLM 2024）
+    attention_deviation,
+    degree_profile,
+    outer_degree,
+)
 
 
 def main():
@@ -77,44 +81,53 @@ def main():
     # 生 attention は batch 平均 [L, H, T, T] で保存（解析用）
     np.save(args.attn_out, np.stack([lp.mean(axis=0) for lp in layer_probs], axis=0))
 
-    # padding を除外し，各サンプルの実トークン領域 [L, H, n, n] で Sink を計測してスカラ平均する．
-    # tail は「末尾 32 byte」ではなく「実トークン末尾 32」を使う（padding を末尾と誤認しない）．
-    mh, mt, ent, srf, srl, anchors = [], [], [], [], [], []
+    # ===== Bai et al. (COLM 2024) 公式準拠の Sink 計測（padding は mask で除外）=====
     B = src_np.shape[0]
+    profiles, layer_deg0, devs, sink_positions = [], [], [], []
     for b in range(B):
         n = int(real_len[b])
         if n < 4:
             continue
-        attn_b = np.stack([lp[b, :, :n, :n] for lp in layer_probs], axis=0)  # [L, H, n, n]
-        w = min(args.sink_window, n - 1)
-        head_pos = list(range(w))
-        tail_pos = list(range(n - w, n))
-        mh.append(sink_mass(attn_b, head_pos))
-        mt.append(sink_mass(attn_b, tail_pos))
-        ent.append(attention_entropy(attn_b))
-        srf.append(sink_rate(attn_b, 0, 0.3))
-        srl.append(sink_rate(attn_b, n - 1, 0.3))  # 実トークン末尾
-        anchors.append(anchor_ratio(attn_b, head_pos, tail_pos))  # [L]
+        mask_b = (src_np[b] != args.pad_id).astype(np.float64)  # [T] 1=実トークン
+        attn_b = np.stack([lp[b] for lp in layer_probs], axis=0)  # [L, H, T, T]
+        prof = degree_profile(attn_b, mask_b)  # [T] 位置別 outer degree（padding=nan）
+        profiles.append(prof)
+        deg = outer_degree(attn_b, mask_b)  # [L, H, T]
+        layer_deg0.append(deg[:, :, 0].mean(axis=1))  # [L] 位置0(CLS) の degree
+        sp = int(np.nanargmax(prof))
+        sink_positions.append(sp)
+        devs.append(float(attention_deviation(attn_b, mask_b)[:, :, sp].mean()))
 
-    anchor_layer = np.nanmean(np.array(anchors), axis=0)  # [L] 層別 anchor 比率（サンプル平均）
+    with np.errstate(invalid="ignore"):  # padding 末尾位置の all-nan 平均を無視
+        prof_mean = np.nanmean(np.array(profiles), axis=0)  # [T]
+        layer_deg0_mean = np.nanmean(np.array(layer_deg0), axis=0)  # [L]
+    mean_real = float(np.mean(real_len))
+    uniform = 1.0 / mean_real  # 一様時の outer degree（基準）
+    sink_pos = int(np.nanargmax(prof_mean))
     metrics = {
+        "metric_source": "Bai et al. COLM 2024 (attention-sink-cl: outer degree + attention deviation)",
         "L_H": [len(layer_probs), int(layer_probs[0].shape[1])],
-        "n_samples_used": len(mh),
-        "mean_real_len": float(np.mean(real_len)),
-        "sink_window": args.sink_window,
-        "sink_mass_head": float(np.mean(mh)),
-        "sink_mass_tail": float(np.mean(mt)),  # 実トークン末尾（padding 除外）
-        "sink_rate_first": float(np.mean(srf)),
-        "sink_rate_last": float(np.mean(srl)),
-        "attention_entropy": float(np.mean(ent)),
-        "anchor_ratio_per_layer": [round(float(x), 4) for x in anchor_layer],
+        "n_samples_used": len(profiles),
+        "mean_real_len": mean_real,
+        "uniform_degree": uniform,
+        "sink_position": sink_pos,  # outer degree 最大の位置（0=CLS かどうかで CLS vs ヘッダを判別）
+        "sink_position_mode": int(np.bincount(sink_positions).argmax()),
+        "sink_degree": float(prof_mean[sink_pos]),
+        "sink_over_uniform": float(prof_mean[sink_pos]) / uniform,  # 一様の何倍＝sink 強度
+        "degree_pos0_cls": float(prof_mean[0]),
+        "pos0_over_uniform": float(prof_mean[0]) / uniform,
+        "sink_deviation": float(np.mean(devs)),  # 低いほど一様＝強い sink
+        "degree_profile_first16": [round(float(x), 4) for x in prof_mean[:16]],
+        "outer_degree_pos0_per_layer": [round(float(x), 4) for x in layer_deg0_mean],
     }
     Path(args.metrics_out).write_text(json.dumps(metrics, indent=2, ensure_ascii=False))
-    scalar = {k: round(v, 4) for k, v in metrics.items() if isinstance(v, float)}
     print(f"[extract] L,H={metrics['L_H']} samples={metrics['n_samples_used']} "
-          f"mean_real_len={metrics['mean_real_len']:.1f}")
-    print(f"[extract] sink (padding 除外): {json.dumps(scalar, ensure_ascii=False)}")
-    print(f"[extract] anchor_ratio/layer (先頭優勢→1, 末尾優勢→0): {metrics['anchor_ratio_per_layer']}")
+          f"mean_real_len={mean_real:.1f}  uniform_degree={uniform:.4f}")
+    print(f"[extract] sink_position={sink_pos} (0=CLS)  sink_over_uniform="
+          f"{metrics['sink_over_uniform']:.2f}x  pos0_over_uniform={metrics['pos0_over_uniform']:.2f}x  "
+          f"deviation={metrics['sink_deviation']:.3f}")
+    print(f"[extract] degree_profile[:16]: {metrics['degree_profile_first16']}")
+    print(f"[extract] outer_degree(pos0)/layer: {metrics['outer_degree_pos0_per_layer']}")
 
     import matplotlib
 
