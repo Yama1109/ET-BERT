@@ -65,6 +65,9 @@ class MultiHeadedAttention(nn.Module):
             scores = scores / math.sqrt(float(per_head_size))
         scores = scores + mask
         probs = nn.Softmax(dim=-1)(scores)
+        # asnfm M2: read-only 計装．softmax 出力（attention map [batch, heads, seq, seq]）を
+        # 退避するだけ．return も計算も変えないためモデルの挙動・出力・精度は不変．
+        self.last_probs = probs.detach()
         probs = self.dropout(probs)
         output = unshape(torch.matmul(probs, value))
         output = self.final_linear(output)
