@@ -1,14 +1,16 @@
-"""M3/M4/C2: 学習済み ET-BERT に攻撃を掛け精度を測る（asnfm 研究スクリプト）.
+"""M3/M4/C2/C8: 学習済み ET-BERT に攻撃を掛け精度を測る（asnfm 研究スクリプト）.
 
 run_classifier.py の Classifier・tokenizer・トークン化手順をそのまま再利用し，推論のみで
 clean と攻撃後の test 精度を比較する（学習は行わない）．
 
 対応する攻撃モード（``--position`` で切り替え）:
-  pre   (M3): 先頭 random byte 付加．byte 内容を random に固定して位置の効果を測る
-  post  (M4): 末尾 random byte 付加（M3 との対照）
+  pre     (M3): 先頭 random byte 付加．byte 内容を random に固定して位置の効果を測る
+  post    (M4): 末尾 random byte 付加（M3 との対照）
   rewrite (C2): TCP ヘッダ場（seq/ack/window/urgent）の値書換のみ（挿入なし）．
-               ``--rewrite_unit_indices`` で書き換える unit を指定する．
                n_pad=0=baseline，n_pad=1=書換適用．
+  swap    (C8): 先頭 unit を別パケットの実ヘッダ値で差し替え（乱数でなく妥当な値）．
+               C2 との差が「位置 vs 値」の答えになる．
+               n_pad=0=baseline，n_pad=1=スワップ適用．
 """
 
 import argparse
@@ -33,7 +35,7 @@ from uer.opts import finetune_opts  # noqa: E402
 from run_classifier import Classifier, count_labels_num  # noqa: E402
 
 from asnfm.attack.text_padding import pad_text_a  # noqa: E402  公式準拠の text_a 注入
-from asnfm.attack.header_rewrite import rewrite_units  # noqa: E402  C2: ヘッダ場書換
+from asnfm.attack.header_rewrite import rewrite_units, swap_units  # noqa: E402  C2/C8
 
 
 def _is_tcp_sample(text_a: str) -> bool:
@@ -87,18 +89,28 @@ def tokenize_to_src_seg(args, text_a):
     return src, seg
 
 
-def evaluate_accuracy(args, model, device, rows, n_pad, position, seed, rewrite_idxs=()):
+def evaluate_accuracy(
+    args, model, device, rows, n_pad, position, seed,
+    rewrite_idxs=(), donor_pool=None,
+):
     """rows に攻撃を注入して推論し accuracy を返す.
 
-    position=="rewrite" のとき: n_pad>0 なら rewrite_idxs の unit を random 書換（C2）
-    それ以外: n_pad>0 なら pad_text_a（M3/M4 padding 注入）
+    position=="rewrite": n_pad>0 なら rewrite_idxs の unit を random 書換（C2）
+    position=="swap":    n_pad>0 なら donor_pool からランダムに donor を選び unit を差替（C8）
+    それ以外:            n_pad>0 なら pad_text_a（M3/M4 padding 注入）
     n_pad==0 は常に baseline（無加工）
     """
     rng = np.random.default_rng(seed)
     src_list, seg_list, gold = [], [], []
+    pool = donor_pool or []
     for label, text_a in rows:
         if n_pad > 0 and position == "rewrite":
             modified = rewrite_units(text_a, list(rewrite_idxs), rng=rng)
+        elif n_pad > 0 and position == "swap" and pool:
+            j = int(rng.integers(0, len(pool)))
+            if pool[j] is text_a:
+                j = (j + 1) % len(pool)
+            modified = swap_units(text_a, list(rewrite_idxs), pool[j])
         elif n_pad > 0:
             modified = pad_text_a(text_a, n_pad, position, rng=rng)
         else:
@@ -132,8 +144,8 @@ def main():
     parser.add_argument("--soft_targets", action="store_true")
     parser.add_argument("--soft_alpha", type=float, default=0.5)
     parser.add_argument("--load_model_path", required=True, help="学習済み（fine-tuned）model")
-    parser.add_argument("--position", choices=["pre", "post", "rewrite"], default="pre",
-                        help="pre=M3（先頭付加）/ post=M4（末尾付加）/ rewrite=C2（ヘッダ場書換）")
+    parser.add_argument("--position", choices=["pre", "post", "rewrite", "swap"], default="pre",
+                        help="pre=M3 / post=M4 / rewrite=C2（乱数書換）/ swap=C8（donor 実値差替）")
     parser.add_argument("--n_pads", default="0,8,16,32,48",
                         help="付加量の sweep（カンマ区切り）．0=baseline．rewrite モードでは 0,1 を推奨")
     parser.add_argument("--rewrite_unit_indices", default="",
@@ -168,11 +180,15 @@ def main():
         if args.rewrite_unit_indices else []
     )
 
+    # C8: donor プールは tcp_only フィルタ後の全 text_a（スワップ元として使う）
+    donor_pool = [text_a for _, text_a in rows] if args.position == "swap" else None
+
     n_pads = [int(x) for x in str(args.n_pads).split(",") if x.strip() != ""]
     results = []
     for n_pad in n_pads:
         acc = evaluate_accuracy(
-            args, model, device, rows, n_pad, args.position, args.seed, rewrite_idxs
+            args, model, device, rows, n_pad, args.position, args.seed,
+            rewrite_idxs, donor_pool,
         )
         results.append({"n_pad": n_pad, "accuracy": acc})
         print(f"[attack] position={args.position} n_pad={n_pad:>4} acc={acc:.4f}", flush=True)
@@ -182,11 +198,10 @@ def main():
         r["acc_drop_vs_baseline"] = (
             None if baseline is None else round(baseline - r["accuracy"], 4)
         )
-    task_label = (
-        "C2 TCP header-field rewrite (seq/ack/window/urgent)"
-        if args.position == "rewrite"
-        else "M3/M4 random-byte padding attack"
-    )
+    task_label = {
+        "rewrite": "C2 TCP header-field rewrite (seq/ack/window/urgent)",
+        "swap":    "C8 TCP header-field swap with donor packet",
+    }.get(args.position, "M3/M4 random-byte padding attack")
     metrics = {
         "task": task_label,
         "injection_layer": "text_a (hex string, AdvTraffic paddingTo1500.py 準拠)",
