@@ -36,8 +36,29 @@ from asnfm.attack.text_padding import pad_text_a  # noqa: E402  公式準拠の 
 from asnfm.attack.header_rewrite import rewrite_units  # noqa: E402  C2: ヘッダ場書換
 
 
-def read_labeled_text(path):
-    """test TSV を (label, text_a) の列で読む（公式 read_dataset と同じ列解釈）."""
+def _is_tcp_sample(text_a: str) -> bool:
+    """text_a byte 8 の上位 4 bit が TCP data offset の妥当域 [5, 15] かで TCP を判定する.
+
+    text_a は ET-BERT の TCP packet_string[76:] 由来（TCP seq 先頭から）．
+    byte 8 = TCP byte 12 = data offset フィールド（上位 4 bit）．
+    UDP パケットでは同位置が payload バイトになるため妥当域外になりやすい．
+    heuristic であり完全な判定ではないが，UDP 混在の交絡を大幅に低減できる．
+    """
+    units = text_a.split()
+    if len(units) < 9:
+        return False
+    try:
+        byte8 = int(units[8][:2], 16)
+    except (ValueError, IndexError):
+        return False
+    return 5 <= (byte8 >> 4) <= 15
+
+
+def read_labeled_text(path, tcp_only: bool = False):
+    """test TSV を (label, text_a) の列で読む（公式 read_dataset と同じ列解釈）.
+
+    tcp_only=True のとき，data offset heuristic で TCP と判定されたサンプルのみ返す．
+    """
     rows, columns = [], {}
     with open(path, mode="r", encoding="utf-8") as f:
         for line_id, line in enumerate(f):
@@ -46,7 +67,10 @@ def read_labeled_text(path):
                     columns[name] = i
                 continue
             line = line[:-1].split("\t")
-            rows.append((int(line[columns["label"]]), line[columns["text_a"]]))
+            text_a = line[columns["text_a"]]
+            if tcp_only and not _is_tcp_sample(text_a):
+                continue
+            rows.append((int(line[columns["label"]]), text_a))
     return rows
 
 
@@ -116,6 +140,8 @@ def main():
                         help="C2 用: 書き換える unit index のカンマ区切り（例 0,1,2,3,4,5,6,7,9,10,11,13,14,15）")
     parser.add_argument("--max_samples", type=int, default=0,
                         help="評価サンプル数の上限（0=全件）")
+    parser.add_argument("--tcp_only", action="store_true",
+                        help="TCP heuristic（data offset byte が妥当域）のサンプルのみ評価する（C2 交絡排除用）")
     parser.add_argument("--metrics_out", required=True)
     args = parser.parse_args()
 
@@ -129,11 +155,13 @@ def main():
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     model = model.to(device).eval()
 
-    rows = read_labeled_text(args.test_path)
+    rows = read_labeled_text(args.test_path, tcp_only=args.tcp_only)
     if args.max_samples > 0:
         rows = rows[: args.max_samples]
     if not rows:
         raise SystemExit("test データが空")
+    if args.tcp_only:
+        print(f"[attack] tcp_only=True: {len(rows)} サンプルを使用（data offset heuristic で絞り込み）", flush=True)
 
     rewrite_idxs = (
         [int(x) for x in args.rewrite_unit_indices.split(",") if x.strip()]
@@ -164,6 +192,7 @@ def main():
         "injection_layer": "text_a (hex string, AdvTraffic paddingTo1500.py 準拠)",
         "position": args.position,
         "rewrite_unit_indices": rewrite_idxs if rewrite_idxs else None,
+        "tcp_only": args.tcp_only,
         "n_eval": len(rows),
         "seq_length": args.seq_length,
         "baseline_accuracy": baseline,
