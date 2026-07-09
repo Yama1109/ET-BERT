@@ -14,6 +14,7 @@ clean と攻撃後の test 精度を比較する（学習は行わない）．
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -91,7 +92,7 @@ def tokenize_to_src_seg(args, text_a):
 
 def evaluate_accuracy(
     args, model, device, rows, n_pad, position, seed,
-    rewrite_idxs=(), donor_pool=None,
+    rewrite_idxs=(), donor_pool=None, preds_out=None,
 ):
     """rows に攻撃を注入して推論し accuracy を返す.
 
@@ -102,19 +103,44 @@ def evaluate_accuracy(
     """
     rng = np.random.default_rng(seed)
     src_list, seg_list, gold = [], [], []
+    donor_gold = []
     pool = donor_pool or []
+    pool_by_label = {}
+    cross_label_cache = {}
+    fallback_cache = None
+    if pool:
+        for idx, (donor_label, _) in enumerate(pool):
+            pool_by_label.setdefault(donor_label, []).append(idx)
     for label, text_a in rows:
         if n_pad > 0 and position == "rewrite":
             modified = rewrite_units(text_a, list(rewrite_idxs), rng=rng)
         elif n_pad > 0 and position == "swap" and pool:
-            j = int(rng.integers(0, len(pool)))
-            if pool[j] is text_a:
+            candidates = cross_label_cache.get(label)
+            if candidates is None:
+                candidates = [
+                    idx
+                    for donor_label, indices in pool_by_label.items()
+                    if donor_label != label
+                    for idx in indices
+                ]
+                cross_label_cache[label] = candidates
+            if not candidates:
+                if fallback_cache is None:
+                    fallback_cache = list(range(len(pool)))
+                candidates = fallback_cache
+            j = candidates[int(rng.integers(0, len(candidates)))]
+            donor_label, donor_text = pool[j]
+            if donor_text is text_a:
                 j = (j + 1) % len(pool)
-            modified = swap_units(text_a, list(rewrite_idxs), pool[j])
+                donor_label, donor_text = pool[j]
+            modified = swap_units(text_a, list(rewrite_idxs), donor_text)
+            donor_gold.append(donor_label)
         elif n_pad > 0:
             modified = pad_text_a(text_a, n_pad, position, rng=rng)
         else:
             modified = text_a
+        if not (n_pad > 0 and position == "swap" and pool):
+            donor_gold.append(None)
         src, seg = tokenize_to_src_seg(args, modified)
         src_list.append(src)
         seg_list.append(seg)
@@ -125,6 +151,7 @@ def evaluate_accuracy(
 
     correct, total = 0, src.size(0)
     bs = args.batch_size
+    pred_all = []
     model.eval()
     with torch.no_grad():
         for i in range(0, total, bs):
@@ -132,7 +159,16 @@ def evaluate_accuracy(
             gb = seg[i : i + bs].to(device)
             _, logits = model(sb, None, gb)
             pred = torch.argmax(logits, dim=1).cpu()
+            pred_all.extend(int(x) for x in pred.tolist())
             correct += int((pred == tgt[i : i + bs]).sum())
+    if preds_out is not None and n_pad > 0 and position == "swap" and pool:
+        os.makedirs(os.path.dirname(preds_out) or ".", exist_ok=True)
+        with open(preds_out, "w", encoding="utf-8", newline="") as f:
+            writer = csv.writer(f, delimiter="\t")
+            writer.writerow(["true", "pred", "donor"])
+            for true_label, pred_label, donor_label in zip(gold, pred_all, donor_gold):
+                writer.writerow([true_label, pred_label, donor_label])
+        print(f"[attack] saved preds: {preds_out}", flush=True)
     return correct / total if total else 0.0
 
 
@@ -155,6 +191,8 @@ def main():
     parser.add_argument("--tcp_only", action="store_true",
                         help="TCP heuristic（data offset byte が妥当域）のサンプルのみ評価する（C2 交絡排除用）")
     parser.add_argument("--metrics_out", required=True)
+    parser.add_argument("--preds_out", default="",
+                        help="C8 donor-pull 用 TSV 出力先（true/pred/donor）。未指定なら metrics_out と同じディレクトリの preds_c8.tsv")
     args = parser.parse_args()
 
     args = load_hyperparam(args)
@@ -180,15 +218,19 @@ def main():
         if args.rewrite_unit_indices else []
     )
 
-    # C8: donor プールは tcp_only フィルタ後の全 text_a（スワップ元として使う）
-    donor_pool = [text_a for _, text_a in rows] if args.position == "swap" else None
+    # C8 donor-pull: donor プールは tcp_only フィルタ後の全 (label, text_a)。
+    # 評価時は可能な限り別クラス donor を選び，予測が donor class に引かれるかを記録する。
+    donor_pool = rows if args.position == "swap" else None
+    preds_out = args.preds_out
+    if args.position == "swap" and not preds_out:
+        preds_out = str(Path(args.metrics_out).with_name("preds_c8.tsv"))
 
     n_pads = [int(x) for x in str(args.n_pads).split(",") if x.strip() != ""]
     results = []
     for n_pad in n_pads:
         acc = evaluate_accuracy(
             args, model, device, rows, n_pad, args.position, args.seed,
-            rewrite_idxs, donor_pool,
+            rewrite_idxs, donor_pool, preds_out,
         )
         results.append({"n_pad": n_pad, "accuracy": acc})
         print(f"[attack] position={args.position} n_pad={n_pad:>4} acc={acc:.4f}", flush=True)
