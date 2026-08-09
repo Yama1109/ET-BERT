@@ -83,7 +83,14 @@ def count_labels_num(path):
 def load_or_initialize_parameters(args, model):
     if args.pretrained_model_path is not None:
         # Initialize with pretrained model.
-        model.load_state_dict(torch.load(args.pretrained_model_path, map_location={'cuda:1':'cuda:0', 'cuda:2':'cuda:0', 'cuda:3':'cuda:0'}), strict=False)
+        map_location = (
+            {"cuda:1": "cuda:0", "cuda:2": "cuda:0", "cuda:3": "cuda:0"}
+            if torch.cuda.is_available()
+            else torch.device("cpu")
+        )
+        model.load_state_dict(
+            torch.load(args.pretrained_model_path, map_location=map_location), strict=False
+        )
     else:
         # Initialize with normal distribution.
         for n, p in list(model.named_parameters()):
@@ -134,7 +141,7 @@ def batch_loader(batch_size, src, tgt, seg, soft_tgt=None):
             yield src_batch, tgt_batch, seg_batch, None
 
 
-def read_dataset(args, path):
+def read_dataset(args, path, max_samples=0):
     dataset, columns = [], {}
     with open(path, mode="r", encoding="utf-8") as f:
         for line_id, line in enumerate(f):
@@ -167,6 +174,8 @@ def read_dataset(args, path):
                 dataset.append((src, tgt, seg, soft_tgt))
             else:
                 dataset.append((src, tgt, seg))
+            if max_samples > 0 and len(dataset) >= max_samples:
+                break
 
     return dataset
 
@@ -266,11 +275,18 @@ def main():
                         help="Train model with logits.")
     parser.add_argument("--soft_alpha", type=float, default=0.5,
                         help="Weight of the soft targets loss.")
+    parser.add_argument("--max_train_samples", type=int, default=0)
+    parser.add_argument("--max_dev_samples", type=int, default=0)
+    parser.add_argument("--max_test_samples", type=int, default=0)
     
     args = parser.parse_args()
 
     # Load the hyperparameters from the config file.
     args = load_hyperparam(args)
+
+    output_parent = os.path.dirname(args.output_model_path)
+    if output_parent:
+        os.makedirs(output_parent, exist_ok=True)
 
     set_seed(args.seed)
 
@@ -290,7 +306,7 @@ def main():
     model = model.to(args.device)
 
     # Training phase.
-    trainset = read_dataset(args, args.train_path)
+    trainset = read_dataset(args, args.train_path, args.max_train_samples)
     random.shuffle(trainset)
     instances_num = len(trainset)
     batch_size = args.batch_size
@@ -323,7 +339,7 @@ def main():
         model = torch.nn.DataParallel(model)
     args.model = model
 
-    total_loss, result, best_result = 0.0, 0.0, 0.0
+    total_loss, result, best_result = 0.0, 0.0, float("-inf")
 
     print("Start training.")
 
@@ -336,7 +352,7 @@ def main():
                 print("Epoch id: {}, Training steps: {}, Avg loss: {:.3f}".format(epoch, i + 1, total_loss / args.report_steps))
                 total_loss = 0.0
 
-        result = evaluate(args, read_dataset(args, args.dev_path))
+        result = evaluate(args, read_dataset(args, args.dev_path, args.max_dev_samples))
         if result[0] > best_result:
             best_result = result[0]
             save_model(model, args.output_model_path)
@@ -348,7 +364,7 @@ def main():
             model.module.load_state_dict(torch.load(args.output_model_path))
         else:
             model.load_state_dict(torch.load(args.output_model_path))
-        evaluate(args, read_dataset(args, args.test_path), True)
+        evaluate(args, read_dataset(args, args.test_path, args.max_test_samples), True)
 
 
 if __name__ == "__main__":
